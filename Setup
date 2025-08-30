@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# openvpn-setup.sh
+# Automatic OpenVPN install + easy add/remove client .ovpn export
+# Target: Ubuntu/Debian (tested on 20.04)
+# Usage:
+#   sudo ./openvpn-setup.sh          # interactive initial install
+#   sudo ./openvpn-setup.sh --add clientname   # add client (requires server already installed)
+#   sudo ./openvpn-setup.sh --revoke clientname # revoke+remove client
+#   sudo ./openvpn-setup.sh --list  # list clients
+#
+set -euo pipefail
+
+# CONFIG DEFAULTS
+EASYRSA_DIR="/etc/openvpn/easy-rsa"
+OUTPUT_DIR="/etc/openvpn/clients"   # where .ovpn files will be saved
+SERVER_NAME="server"
+VPN_NET="10.8.0.0"
+VPN_MASK="255.255.255.0"
+PROTO_DEFAULT="udp"
+PORT_DEFAULT="1194"
+DNS1="1.1.1.1"
+DNS2="8.8.8.8"
+CRL_PEM="$EASYRSA_DIR/pki/crl.pem"
+IP_FORWARD_CONF="/etc/sysctl.d/99-openvpn.conf"
+IPTABLES_SAVE="/etc/iptables/rules.v4"
+
+# helper
+log(){ printf "\n[+] %s\n" "$*"; }
+err(){ printf "\n[!] %s\n" "$*" >&2; }
+
+# ensure running as root
+if [ "$EUID" -ne 0 ]; then
+  err "Run as root: sudo $0"
+  exit 1
+fi
+
+# parse args (simple)
+ACTION="install"
+CLIENTNAME=""
+while (( "$#" )); do
+  case "$1" in
+    --add) ACTION="add"; CLIENTNAME="${2:-}"; shift 2;;
+    --revoke|--remove) ACTION="revoke"; CLIENTNAME="${2:-}"; shift 2;;
+    --list) ACTION="list"; shift;;
+    --port) PORT_ARG="${2:-}"; PORT_DEFAULT="$PORT_ARG"; shift 2;;
+    --proto) PROTO_DEFAULT="${2:-udp}"; shift 2;;
+    --help|-h) echo "Usage: $0 [--add name | --revoke name | --list]"; exit 0;;
+    *) shift;;
+  esac
+done
+
+# Utility functions
+ensure_packages(){
+  log "Updating and installing required packages..."
+  apt-get update -y
+  apt-get install -y openvpn easy-rsa iptables-persistent curl
+}
+
+init_easyrsa(){
+  log "Initializing Easy-RSA at $EASYRSA_DIR..."
+  mkdir -p "$EASYRSA_DIR"
+  # Copy default Easy-RSA files (most distros package them)
+  if [ -d /usr/share/easy-rsa ]; then
+    cp -r /usr/share/easy-rsa/* "$EASYRSA_DIR/"
+  else
+    # fallback: try apt-get easy-rsa already installed above should have populated
+    err "easy-rsa not found in /usr/share/easy-rsa — aborting"
+    exit 1
+  fi
+  chown -R root:root "$EASYRSA_DIR"
+  cd "$EASYRSA_DIR"
+  ./easyrsa init-pki >/dev/null
+  # Build CA (no passphrase for automation)
+  yes "" | ./easyrsa build-ca nopass >/dev/null
+  # Server key
+  ./easyrsa gen-req "$SERVER_NAME" nopass >/dev/null
+  ./easyrsa sign-req server "$SERVER_NAME" <<< "yes" >/dev/null
+  # Diffie-Hellman and CRL
+  ./easyrsa gen-dh >/dev/null
+  ./easyrsa gen-crl >/dev/null
+  # ta.key for tls-crypt
+  openvpn --genkey --secret "$EASYRSA_DIR/ta.key"
+  log "Easy-RSA PKI created."
+}
+
+generate_server_conf(){
+  local port proto
+  read -rp "Server public IP or domain (what clients will connect to): " REMOTE_HOST
+  read -rp "Listening port [$PORT_DEFAULT]: " port; port=${port:-$PORT_DEFAULT}
+  read -rp "Protocol (udp/tcp) [$PROTO_DEFAULT]: " proto; proto=${proto:-$PROTO_DEFAULT}
+
+  mkdir -p /etc/openvpn
+  cat > /etc/openvpn/server.conf <<EOF
+port $port
+proto $proto
+dev tun
+ca $EASYRSA_DIR/pki/ca.crt
+cert $EASYRSA_DIR/pki/issued/$SERVER_NAME.crt
+key $EASYRSA_DIR/pki/private/$SERVER_NAME.key
+dh $EASYRSA_DIR/pki/dh.pem
+topology subnet
+server $VPN_NET $VPN_MASK
+ifconfig-pool-persist /var/log/openvpn/ipp.txt
+push "redirect-gateway def1 bypass-dhcp"
+push "dhcp-option DNS $DNS1"
+push "dhcp-option DNS $DNS2"
+keepalive 10 120
+tls-crypt $EASYRSA_DIR/ta.key
+cipher AES-256-CBC
+persist-key
+persist-tun
+status /var/log/openvpn/openvpn-status.log
+verb 3
+crl-verify $CRL_PEM
+user nobody
+group nogroup
+EOF
+
+  # create easy client output dir
+  mkdir -p "$OUTPUT_DIR"
+  chown -R root:root "$OUTPUT_DIR"
+  systemctl enable openvpn@server
+  systemctl daemon-reload
+
+  # create firewall rules + IP forwarding
+  echo "net.ipv4.ip_forward=1" > "$IP_FORWARD_CONF"
+  sysctl --system >/dev/null || true
+
+  # NAT rules
+  # determine external interface automatically (best-effort)
+  EXT_IF="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+  if [ -z "$EXT_IF" ]; then
+    err "Could not autodetect external interface, please update iptables rules manually."
+  else
+    iptables -t nat -A POSTROUTING -s "${VPN_NET}/${VPN_MASK##*.}" -o "$EXT_IF" -j MASQUERADE || true
+    iptables -A FORWARD -s "${VPN_NET}/${VPN_MASK##*.}" -j ACCEPT || true
+    iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT || true
+    mkdir -p /etc/iptables
+    iptables-save > "$IPTABLES_SAVE"
+  fi
+
+  # Copy server certs to /etc/openvpn
+  cp "$EASYRSA_DIR/pki/ca.crt" /etc/openvpn/
+  cp "$EASYRSA_DIR/pki/issued/$SERVER_NAME.crt" /etc/openvpn/
+  cp "$EASYRSA_DIR/pki/private/$SERVER_NAME.key" /etc/openvpn/
+  cp "$EASYRSA_DIR/pki/dh.pem" /etc/openvpn/
+  cp "$EASYRSA_DIR/ta.key" /etc/openvpn/
+  cp "$EASYRSA_DIR/pki/crl.pem" /etc/openvpn/
+  chmod 644 /etc/openvpn/crl.pem
+
+  # start service
+  systemctl restart openvpn@server
+  log "OpenVPN server installed and started. Clients must connect to: $REMOTE_HOST:$port/$proto"
+  echo "$REMOTE_HOST" > /etc/openvpn/remote_host.info
+  echo "$port" > /etc/openvpn/remote_port.info
+  echo "$proto" > /etc/openvpn/remote_proto.info
+}
+
+# Create client ovpn bundle
+create_ovpn(){
+  local name="$1"
+  local remote_host port proto
+  if [ -f /etc/openvpn/remote_host.info ]; then
+    remote_host="$(cat /etc/openvpn/remote_host.info)"
+    port="$(cat /etc/openvpn/remote_port.info)"
+    proto="$(cat /etc/openvpn/remote_proto.info)"
+  else
+    read -rp "Enter server public IP/domain: " remote_host
+    read -rp "Enter server port: " port
+    read -rp "Enter proto (udp/tcp): " proto
+  fi
+
+  local outfile="$OUTPUT_DIR/$name.ovpn"
+  cat > "$outfile" <<EOF
+client
+dev tun
+proto $proto
+remote $remote_host $port
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+remote-cert-tls server
+cipher AES-256-CBC
+verb 3
+key-direction 1
+EOF
+
+  # embed certs/keys
+  {
+    echo "<ca>"
+    cat "$EASYRSA_DIR/pki/ca.crt"
+    echo "</ca>"
+    echo "<cert>"
+    awk '/BEGIN CERTIFICATE/{flag=1} flag{print} /END CERTIFICATE/{print; flag=0}' "$EASYRSA_DIR/pki/issued/$name.crt"
+    echo "</cert>"
+    echo "<key>"
+    sed -n '/BEGIN PRIVATE KEY/,$p' "$EASYRSA_DIR/pki/private/$name.key"
+    echo "</key>"
+    echo "<tls-crypt>"
+    cat "$EASYRSA_DIR/ta.key"
+    echo "</tls-crypt>"
+  } >> "$outfile"
+
+  chmod 600 "$outfile"
+  log "Created $outfile"
+}
+
+# Add client (generate certificate + produce single .ovpn)
+add_client(){
+  local name="$1"
+  if [ -z "$name" ]; then err "client name required"; exit 1; fi
+  cd "$EASYRSA_DIR"
+  ./easyrsa gen-req "$name" nopass >/dev/null
+  ./easyrsa sign-req client "$name" <<< "yes" >/dev/null
+  # copy issued cert and private key to pki (they already are in pki)
+  # create ovpn
+  create_ovpn "$name"
+}
+
+# Revoke client and remove .ovpn
+revoke_client(){
+  local name="$1"
+  if [ -z "$name" ]; then err "client name required"; exit 1; fi
+  cd "$EASYRSA_DIR"
+  # revoke cert and regenerate CRL
+  ./easyrsa revoke "$name" <<< "yes" >/dev/null
+  ./easyrsa gen-crl >/dev/null
+  # update server CRL
+  cp "$EASYRSA_DIR/pki/crl.pem" /etc/openvpn/crl.pem
+  chmod 644 /etc/openvpn/crl.pem
+  # remove ovpn file
+  if [ -f "$OUTPUT_DIR/$name.ovpn" ]; then
+    shred -u "$OUTPUT_DIR/$name.ovpn" || rm -f "$OUTPUT_DIR/$name.ovpn"
+    log "Removed $OUTPUT_DIR/$name.ovpn"
+  else
+    log "No .ovpn file found for $name"
+  fi
+  # restart openvpn to reload CRL
+  systemctl restart openvpn@server
+  log "Revoked client $name"
+}
+
+list_clients(){
+  # parse pki/index.txt for issued certificates
+  if [ -f "$EASYRSA_DIR/pki/index.txt" ]; then
+    echo "Clients (from Easy-RSA index):"
+    awk -F'\t' '/^V/ {print $5}' "$EASYRSA_DIR/pki/index.txt" | sed 's#/CN=##'
+    echo
+    echo "Generated .ovpn files:"
+    ls -1 "$OUTPUT_DIR"/*.ovpn 2>/dev/null || echo "(none)"
+  else
+    echo "No PKI found. Run initial install first."
+  fi
+}
+
+# Main actions
+case "$ACTION" in
+  install)
+    if [ -d "$EASYRSA_DIR/pki" ]; then
+      log "OpenVPN PKI already exists. If you want to re-install, remove $EASYRSA_DIR/pki first."
+      exit 1
+    fi
+    ensure_packages
+    init_easyrsa
+    generate_server_conf
+    log "Initial install complete. Use --add clientname to create clients."
+    ;;
+  add)
+    if [ -z "$CLIENTNAME" ]; then
+      read -rp "Client name to add: " CLIENTNAME
+    fi
+    if [ ! -d "$EASYRSA_DIR/pki" ]; then
+      err "Server not installed / PKI not found. Run the script without --add first to install."
+      exit 1
+    fi
+    add_client "$CLIENTNAME"
+    ;;
+  revoke)
+    if [ -z "$CLIENTNAME" ]; then
+      read -rp "Client name to revoke: " CLIENTNAME
+    fi
+    if [ ! -d "$EASYRSA_DIR/pki" ]; then
+      err "Server not installed / PKI not found."
+      exit 1
+    fi
+    revoke_client "$CLIENTNAME"
+    ;;
+  list)
+    list_clients
+    ;;
+  *)
+    err "Unknown action"
+    exit 1
+    ;;
+esac
+
+exit 0
